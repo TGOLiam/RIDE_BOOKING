@@ -1,8 +1,9 @@
 #include <chrono>
 #include <climits>
+#include <condition_variable>
 #include <cstdlib>
-#include <cstring>
 #include <ctime>
+#include <cstring>
 #include <iostream>
 #include <map>
 #include <memory>
@@ -15,75 +16,73 @@
 #include <vector>
 
 #ifdef _WIN32
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
+#define NOMINMAX
 #include <winsock2.h>
 #include <ws2tcpip.h>
-#ifdef _MSC_VER
 #pragma comment(lib, "Ws2_32.lib")
-#endif
+using Socket = SOCKET;
+const Socket INVALID_SOCKET_FD = INVALID_SOCKET;
 #else
+#include <arpa/inet.h>
 #include <csignal>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
+using Socket = int;
+const Socket INVALID_SOCKET_FD = -1;
 #endif
 
 using namespace std;
 
-#ifdef _WIN32
-using SocketHandle = SOCKET;
-using SocketLength = int;
-const SocketHandle INVALID_SOCKET_HANDLE = INVALID_SOCKET;
-
-bool socket_startup() {
-  WSADATA data;
-  return WSAStartup(MAKEWORD(2, 2), &data) == 0;
-}
-
-void socket_cleanup() { WSACleanup(); }
-
-void close_socket(SocketHandle fd) { closesocket(fd); }
-
-bool socket_call_failed(int result) { return result == SOCKET_ERROR; }
-#else
-using SocketHandle = int;
-using SocketLength = socklen_t;
-const SocketHandle INVALID_SOCKET_HANDLE = -1;
-
-bool socket_startup() { return true; }
-
-void socket_cleanup() {}
-
-void close_socket(SocketHandle fd) { close(fd); }
-
-bool socket_call_failed(int result) { return result < 0; }
-#endif
-
-bool socket_is_invalid(SocketHandle fd) {
-  return fd == INVALID_SOCKET_HANDLE;
-}
-
-// ─── Config
-// ────────────────────────────────────────────────────────────────
+// ─── Constants ──────────────────────────────────────────────────────────────
 
 const int MAP_W = 10;
 const int MAP_H = 10;
-const int DRIVER_CONFIRM_TIMEOUT_MS = 5000;
 const int DISPATCHER_THREADS = 4;
+const int DRIVER_CONFIRM_TIMEOUT_MS = 5000;
 const int MAX_BOOKING_RETRIES = 5;
+const int SERVER_PORT = 8000;
 
-// ─── Domain Models
-// ─────────────────────────────────────────────────────────────────
+// ─── Platform Socket Helpers ────────────────────────────────────────────────
+
+bool socket_init() {
+#ifdef _WIN32
+  WSADATA data;
+  return WSAStartup(MAKEWORD(2, 2), &data) == 0;
+#else
+  signal(SIGPIPE, SIG_IGN);
+  return true;
+#endif
+}
+
+void socket_cleanup() {
+#ifdef _WIN32
+  WSACleanup();
+#endif
+}
+
+void socket_close(Socket s) {
+#ifdef _WIN32
+  closesocket(s);
+#else
+  close(s);
+#endif
+}
+
+// ─── Domain Types ───────────────────────────────────────────────────────────
 
 struct Position {
-  int x, y;
+  int x;
+  int y;
 };
 
-int dist(Position a, Position b) { return abs(a.x - b.x) + abs(a.y - b.y); }
+int grid_distance(Position a, Position b) {
+  return abs(a.x - b.x) + abs(a.y - b.y);
+}
 
 enum class DriverState { AVAILABLE, RESERVED, BOOKED, OFFLINE };
+
+enum class BookingState { QUEUED, MATCHING, WAITING, BOOKED, COMPLETED, FAILED };
 
 string driver_state_name(DriverState s) {
   switch (s) {
@@ -98,25 +97,6 @@ string driver_state_name(DriverState s) {
   }
   return "UNKNOWN";
 }
-
-struct Driver {
-  int driver_id;
-  DriverState state;
-  int booking_id;
-  chrono::steady_clock::time_point offer_start_time;
-
-  Position pos;
-  mutex mtx;
-};
-
-enum class BookingState {
-  QUEUED,
-  MATCHING,
-  WAITING,
-  BOOKED,
-  COMPLETED,
-  FAILED
-};
 
 string booking_state_name(BookingState s) {
   switch (s) {
@@ -136,117 +116,43 @@ string booking_state_name(BookingState s) {
   return "UNKNOWN";
 }
 
-struct Booking {
+struct Driver {
+  int id;
+  DriverState state;
   int booking_id;
+  Position pos;
+  chrono::steady_clock::time_point offer_start_time;
+  mutex mtx;
+};
+
+struct Booking {
+  int id;
   BookingState state;
   int driver_id;
   int retry_count;
-
   Position pickup;
   Position destination;
   mutex mtx;
 };
 
-// ─── Booking Queue Actor
-// ─────────────────────────────────────────────────────────────
-
-struct BookingQueue {
-  mutex mtx;
-  queue<int> q;
-
-  void push(int id) {
-    lock_guard<mutex> lock(mtx);
-    q.push(id);
-  }
-
-  bool pop(int *id) {
-    lock_guard<mutex> lock(mtx);
-    if (q.empty())
-      return false;
-    *id = q.front();
-    q.pop();
-    return true;
-  }
+struct BookingView {
+  int id;
+  string state;
+  int driver_id;
+  int retry_count;
 };
 
-// ─── Booking Registry
-// ────────────────────────────────────────────────────────── Pure container:
-// only add and get. State transitions are inline in callers.
-
-struct BookingRegistry {
-  mutex mtx;
-  map<int, unique_ptr<Booking>> bookings;
-
-  bool add(unique_ptr<Booking> b) {
-    lock_guard<mutex> lock(mtx);
-    bookings[b->booking_id] = std::move(b);
-    return true;
-  }
-
-  Booking *get(int id) {
-    lock_guard<mutex> lock(mtx);
-    auto it = bookings.find(id);
-    return it == bookings.end() ? nullptr : it->second.get();
-  }
+struct DriverView {
+  int id;
+  string state;
+  int booking_id;
+  int x;
+  int y;
 };
 
-// ─── Driver Registry
-// ─────────────────────────────────────────────────────────── Pure container +
-// query (find_nearest is read-only on state).
+// ─── Logger ─────────────────────────────────────────────────────────────────
 
-struct DriverRegistry {
-  mutex mtx;
-  map<int, unique_ptr<Driver>> drivers;
-
-  bool add(unique_ptr<Driver> d) {
-    lock_guard<mutex> lock(mtx);
-    drivers[d->driver_id] = std::move(d);
-    return true;
-  }
-
-  Driver *get(int id) {
-    lock_guard<mutex> lock(mtx);
-    auto it = drivers.find(id);
-    return it == drivers.end() ? nullptr : it->second.get();
-  }
-
-  int find_nearest(Position pickup_pos) {
-    int best_id = -1;
-    int best_d = INT_MAX;
-
-    for (int pass = 0; pass < 3; pass++) {
-      for (auto &entry : drivers) {
-        Driver &d = *entry.second;
-        if (!d.mtx.try_lock())
-          continue;
-        if (d.state == DriverState::AVAILABLE) {
-          int ddist = dist(d.pos, pickup_pos);
-          if (ddist < best_d) {
-            best_d = ddist;
-            best_id = d.driver_id;
-          }
-        }
-        d.mtx.unlock();
-      }
-      if (best_id != -1)
-        break;
-    }
-    return best_id;
-  }
-};
-
-// ─── Server State
-// ──────────────────────────────────────────────────────────────────
-
-BookingQueue booking_q;
-BookingRegistry booking_reg;
-DriverRegistry driver_reg;
-mutex next_id_mtx;
 mutex log_mtx;
-int next_booking_id = 1;
-
-// ─── Logger
-// ─────────────────────────────────────────────────────────────
 
 void log_event(const string &level, const string &event, int booking_id,
                int driver_id, const string &message) {
@@ -255,384 +161,563 @@ void log_event(const string &level, const string &event, int booking_id,
        << " driver=" << driver_id << " " << message << endl;
 }
 
-// ─── Driver Setup Flow
-// ─────────────────────────────────────────────────────────────
+// ─── BookingQueue ───────────────────────────────────────────────────────────
 
-void add_driver(int id, Position pos) {
-  auto d = make_unique<Driver>();
-  d->driver_id = id;
-  d->state = DriverState::OFFLINE;
-  d->booking_id = -1;
-  d->pos = pos;
-  driver_reg.add(std::move(d));
-}
+class BookingQueue {
+private:
+  queue<int> q;
+  mutex mtx;
+  condition_variable cv;
 
-// ─── Passenger Booking Flow
-// ─────────────────────────────────────────────────────────────
-
-int create_booking(Position pickup, Position destination) {
-  int id;
-  {
-    lock_guard<mutex> lock(next_id_mtx);
-    id = next_booking_id++;
+public:
+  void push(int id) {
+    {
+      lock_guard<mutex> lock(mtx);
+      q.push(id);
+    }
+    cv.notify_one();
   }
 
-  auto b = make_unique<Booking>();
-  b->booking_id = id;
-  b->state = BookingState::QUEUED;
-  b->driver_id = -1;
-  b->retry_count = 0;
-  b->pickup = pickup;
-  b->destination = destination;
+  int wait_pop() {
+    unique_lock<mutex> lock(mtx);
+    cv.wait(lock, [&] { return !q.empty(); });
+    int id = q.front();
+    q.pop();
+    return id;
+  }
+};
 
-  booking_reg.add(std::move(b));
-  booking_q.push(id);
-  log_event("INFO", "BOOKING_CREATED", id, -1, "queued");
-  return id;
-}
+// ─── BookingSystem ──────────────────────────────────────────────────────────
 
-// Shared requeue-or-fail logic used by dispatcher, watcher, and reject.
-bool requeue_or_fail(int booking_id, bool *requeue) {
-  *requeue = false;
-  Booking *b = booking_reg.get(booking_id);
-  if (!b)
-    return false;
+class BookingSystem {
+private:
+  BookingQueue booking_queue;
 
-  lock_guard<mutex> bl(b->mtx);
-  if (b->state == BookingState::BOOKED || b->state == BookingState::COMPLETED ||
-      b->state == BookingState::FAILED)
-    return false;
+  mutex booking_reg_mtx;
+  map<int, unique_ptr<Booking>> bookings;
 
-  b->retry_count++;
-  b->driver_id = -1;
+  mutex driver_reg_mtx;
+  map<int, unique_ptr<Driver>> drivers;
 
-  if (b->retry_count >= MAX_BOOKING_RETRIES) {
-    b->state = BookingState::FAILED;
-    log_event("INFO", "BOOKING_FAILED", booking_id, -1, "retry limit reached");
+  mutex next_id_mtx;
+  int next_booking_id;
+
+public:
+  BookingSystem() : next_booking_id(1) {
+    log_event("INFO", "SERVER_STARTED", -1, -1,
+              "drivers=0 waiting_for_driver_clients");
+  }
+
+  int create_booking(Position pickup, Position destination) {
+    int id;
+    {
+      lock_guard<mutex> lock(next_id_mtx);
+      id = next_booking_id++;
+    }
+
+    auto b = make_unique<Booking>();
+    b->id = id;
+    b->state = BookingState::QUEUED;
+    b->driver_id = -1;
+    b->retry_count = 0;
+    b->pickup = pickup;
+    b->destination = destination;
+
+    {
+      lock_guard<mutex> lock(booking_reg_mtx);
+      bookings[id] = move(b);
+    }
+
+    booking_queue.push(id);
+    log_event("INFO", "BOOKING_CREATED", id, -1, "queued");
+    return id;
+  }
+
+  bool get_booking(int id, BookingView &out) {
+    Booking *b = booking_ptr(id);
+    if (!b)
+      return false;
+
+    lock_guard<mutex> lock(b->mtx);
+    out.id = b->id;
+    out.state = booking_state_name(b->state);
+    out.driver_id = b->driver_id;
+    out.retry_count = b->retry_count;
     return true;
   }
 
-  b->state = BookingState::QUEUED;
-  *requeue = true;
-  log_event("INFO", "BOOKING_REQUEUED", booking_id, -1,
-            "retry=" + to_string(b->retry_count));
-  return true;
-}
+  vector<BookingView> list_bookings() {
+    vector<BookingView> result;
+    lock_guard<mutex> reg_lock(booking_reg_mtx);
 
-// ─── Driver Action Flow
-// ─────────────────────────────────────────────────────────────
+    for (auto &entry : bookings) {
+      Booking &b = *entry.second;
+      lock_guard<mutex> lock(b.mtx);
+      result.push_back(
+          {b.id, booking_state_name(b.state), b.driver_id, b.retry_count});
+    }
 
-bool set_driver_online(int driver_id, bool has_pos, Position pos) {
-  Driver *d = driver_reg.get(driver_id);
-  if (!d)
-    return false;
-
-  lock_guard<mutex> dl(d->mtx);
-  if (d->state == DriverState::RESERVED || d->state == DriverState::BOOKED)
-    return false;
-
-  if (has_pos)
-    d->pos = pos;
-  d->state = DriverState::AVAILABLE;
-  d->booking_id = -1;
-
-  log_event("INFO", "DRIVER_ONLINE", -1, driver_id, "driver available");
-  return true;
-}
-
-bool set_driver_offline(int driver_id) {
-  Driver *d = driver_reg.get(driver_id);
-  if (!d)
-    return false;
-
-  int booking_id = -1;
-
-  {
-    lock_guard<mutex> dl(d->mtx);
-    if (d->state == DriverState::BOOKED)
-      return false;
-
-    if (d->state == DriverState::RESERVED)
-      booking_id = d->booking_id;
-
-    d->state = DriverState::OFFLINE;
-    d->booking_id = -1;
+    return result;
   }
 
-  if (booking_id != -1) {
-    bool requeue = false;
-    if (requeue_or_fail(booking_id, &requeue) && requeue)
-      booking_q.push(booking_id);
+  bool get_driver(int id, DriverView &out) {
+    Driver *d = driver_ptr(id);
+    if (!d)
+      return false;
+
+    lock_guard<mutex> lock(d->mtx);
+    out.id = d->id;
+    out.state = driver_state_name(d->state);
+    out.booking_id = d->booking_id;
+    out.x = d->pos.x;
+    out.y = d->pos.y;
+    return true;
   }
 
-  log_event("INFO", "DRIVER_OFFLINE", booking_id, driver_id, "driver offline");
-  return true;
-}
+  vector<DriverView> list_drivers() {
+    vector<DriverView> result;
+    lock_guard<mutex> reg_lock(driver_reg_mtx);
 
-bool accept_booking(int driver_id, int booking_id) {
-  Driver *d = driver_reg.get(driver_id);
-  if (!d)
-    return false;
+    for (auto &entry : drivers) {
+      Driver &d = *entry.second;
+      lock_guard<mutex> lock(d.mtx);
+      result.push_back(
+          {d.id, driver_state_name(d.state), d.booking_id, d.pos.x, d.pos.y});
+    }
 
-  {
-    lock_guard<mutex> dl(d->mtx);
-    if (d->state != DriverState::RESERVED || d->booking_id != booking_id)
-      return false;
-    d->state = DriverState::BOOKED;
+    return result;
   }
 
-  Booking *b = booking_reg.get(booking_id);
-  if (!b)
-    return false;
-
-  {
-    lock_guard<mutex> bl(b->mtx);
-    if (b->state != BookingState::WAITING)
+  bool set_driver_online(int driver_id, bool has_pos, Position pos) {
+    if (driver_id <= 0)
       return false;
-    b->state = BookingState::BOOKED;
-  }
 
-  log_event("INFO", "DRIVER_ACCEPTED", booking_id, driver_id, "ride booked");
-  return true;
-}
-
-bool reject_booking(int driver_id, int booking_id) {
-  Driver *d = driver_reg.get(driver_id);
-  if (!d)
-    return false;
-
-  {
-    lock_guard<mutex> dl(d->mtx);
-    if (d->state != DriverState::RESERVED || d->booking_id != booking_id)
+    Position initial_pos = has_pos ? pos : Position{rand() % MAP_W, rand() % MAP_H};
+    Driver *d = driver_ptr_or_create(driver_id, initial_pos);
+    if (!d)
       return false;
+
+    unique_lock<mutex> driver_lock(d->mtx);
+    if (d->state == DriverState::RESERVED || d->state == DriverState::BOOKED)
+      return false;
+
+    if (has_pos)
+      d->pos = pos;
     d->state = DriverState::AVAILABLE;
     d->booking_id = -1;
+
+    log_event("INFO", "DRIVER_ONLINE", -1, driver_id, "driver available");
+    return true;
   }
 
-  bool requeue = false;
-  if (!requeue_or_fail(booking_id, &requeue))
-    return false;
-  if (requeue)
-    booking_q.push(booking_id);
-  log_event("INFO", "DRIVER_REJECTED", booking_id, driver_id, "offer rejected");
-  return true;
-}
+  bool set_driver_offline(int driver_id) {
+    Driver *d = driver_ptr(driver_id);
+    if (!d)
+      return false;
 
-bool finish_booking(int driver_id, int booking_id) {
-  Driver *d = driver_reg.get(driver_id);
-  if (!d)
-    return false;
+    bool should_requeue = false;
+    int booking_id = -1;
 
-  Position dest;
+    {
+      unique_lock<mutex> driver_lock(d->mtx);
+      if (d->state == DriverState::BOOKED)
+        return false;
 
-  {
-    lock_guard<mutex> dl(d->mtx);
+      if (d->state == DriverState::RESERVED) {
+        booking_id = d->booking_id;
+        Booking *b = booking_ptr(booking_id);
+        if (!b)
+          return false;
+
+        unique_lock<mutex> booking_lock(b->mtx);
+        if (b->state == BookingState::WAITING && b->driver_id == driver_id)
+          should_requeue = requeue_or_fail_booking_locked(*b);
+      }
+
+      d->state = DriverState::OFFLINE;
+      d->booking_id = -1;
+    }
+
+    if (should_requeue)
+      booking_queue.push(booking_id);
+
+    log_event("INFO", "DRIVER_OFFLINE", booking_id, driver_id,
+              "driver offline");
+    return true;
+  }
+
+  bool accept_booking(int driver_id, int booking_id) {
+    Driver *d = driver_ptr(driver_id);
+    if (!d)
+      return false;
+
+    unique_lock<mutex> driver_lock(d->mtx);
+    if (d->state != DriverState::RESERVED || d->booking_id != booking_id)
+      return false;
+
+    Booking *b = booking_ptr(booking_id);
+    if (!b)
+      return false;
+
+    unique_lock<mutex> booking_lock(b->mtx);
+    if (b->state != BookingState::WAITING || b->driver_id != driver_id)
+      return false;
+
+    d->state = DriverState::BOOKED;
+    b->state = BookingState::BOOKED;
+
+    log_event("INFO", "DRIVER_ACCEPTED", booking_id, driver_id, "ride booked");
+    return true;
+  }
+
+  bool reject_booking(int driver_id, int booking_id) {
+    Driver *d = driver_ptr(driver_id);
+    if (!d)
+      return false;
+
+    bool should_requeue = false;
+
+    {
+      unique_lock<mutex> driver_lock(d->mtx);
+      if (d->state != DriverState::RESERVED || d->booking_id != booking_id)
+        return false;
+
+      Booking *b = booking_ptr(booking_id);
+      if (!b)
+        return false;
+
+      unique_lock<mutex> booking_lock(b->mtx);
+      if (b->state != BookingState::WAITING || b->driver_id != driver_id)
+        return false;
+
+      d->state = DriverState::AVAILABLE;
+      d->booking_id = -1;
+
+      should_requeue = requeue_or_fail_booking_locked(*b);
+    }
+
+    if (should_requeue)
+      booking_queue.push(booking_id);
+
+    log_event("INFO", "DRIVER_REJECTED", booking_id, driver_id,
+              "offer rejected");
+    return true;
+  }
+
+  bool finish_booking(int driver_id, int booking_id) {
+    Driver *d = driver_ptr(driver_id);
+    if (!d)
+      return false;
+
+    unique_lock<mutex> driver_lock(d->mtx);
     if (d->state != DriverState::BOOKED || d->booking_id != booking_id)
       return false;
 
-    Booking *b = booking_reg.get(booking_id);
+    Booking *b = booking_ptr(booking_id);
     if (!b)
       return false;
 
-    lock_guard<mutex> bl(b->mtx);
-    dest = b->destination;
-  }
+    unique_lock<mutex> booking_lock(b->mtx);
+    if (b->state != BookingState::BOOKED || b->driver_id != driver_id)
+      return false;
 
-  {
-    lock_guard<mutex> dl(d->mtx);
-    d->pos = dest;
+    d->pos = b->destination;
     d->state = DriverState::AVAILABLE;
     d->booking_id = -1;
-  }
-
-  Booking *b = booking_reg.get(booking_id);
-  if (!b)
-    return false;
-
-  {
-    lock_guard<mutex> bl(b->mtx);
-    if (b->state != BookingState::BOOKED)
-      return false;
     b->state = BookingState::COMPLETED;
+
+    log_event("INFO", "BOOKING_COMPLETED", booking_id, driver_id,
+              "ride finished");
+    return true;
   }
 
-  log_event("INFO", "BOOKING_COMPLETED", booking_id, driver_id,
-            "ride finished");
-  return true;
-}
-
-// ─── Dispatcher Actor
-// ──────────────────────────────────────────────────────────────────
-
-void dispatcher() {
-  while (true) {
-    int id;
-    if (!booking_q.pop(&id)) {
-      this_thread::sleep_for(chrono::milliseconds(50));
-      continue;
+  void start_workers() {
+    for (int i = 0; i < DISPATCHER_THREADS; i++) {
+      thread t(&BookingSystem::dispatcher_loop, this);
+      t.detach();
     }
 
-    Booking *b = booking_reg.get(id);
+    thread monitor(&BookingSystem::monitor_loop, this);
+    monitor.detach();
+  }
+
+private:
+  Booking *booking_ptr(int id) {
+    lock_guard<mutex> lock(booking_reg_mtx);
+    auto it = bookings.find(id);
+    return it == bookings.end() ? nullptr : it->second.get();
+  }
+
+  Driver *driver_ptr(int id) {
+    lock_guard<mutex> lock(driver_reg_mtx);
+    auto it = drivers.find(id);
+    return it == drivers.end() ? nullptr : it->second.get();
+  }
+
+  Driver *driver_ptr_or_create(int id, Position pos) {
+    lock_guard<mutex> lock(driver_reg_mtx);
+    auto it = drivers.find(id);
+    if (it != drivers.end())
+      return it->second.get();
+
+    auto d = make_unique<Driver>();
+    d->id = id;
+    d->state = DriverState::OFFLINE;
+    d->booking_id = -1;
+    d->pos = pos;
+    Driver *ptr = d.get();
+    drivers[id] = move(d);
+    return ptr;
+  }
+
+  bool requeue_or_fail(int booking_id) {
+    Booking *b = booking_ptr(booking_id);
     if (!b)
-      continue;
+      return false;
 
-    Position pickup;
-
-    // QUEUED → MATCHING (inline state transition)
+    bool should_requeue = false;
     {
-      lock_guard<mutex> bl(b->mtx);
-      if (b->state != BookingState::QUEUED)
-        continue;
-      b->state = BookingState::MATCHING;
-      pickup = b->pickup;
+      lock_guard<mutex> lock(b->mtx);
+      if (b->state == BookingState::BOOKED ||
+          b->state == BookingState::COMPLETED ||
+          b->state == BookingState::FAILED)
+        return false;
+
+      should_requeue = requeue_or_fail_booking_locked(*b);
     }
-    log_event("INFO", "BOOKING_MATCHING", id, -1,
-              "dispatcher started matching");
 
-    while (true) {
-      int driver_id = driver_reg.find_nearest(pickup);
+    if (should_requeue)
+      booking_queue.push(booking_id);
+    return true;
+  }
 
-      if (driver_id < 0) {
-        // No driver available at all — wait a meaningful amount of time
-        // so drivers have a chance to finish their 5-second confirmation
-        // window before burning through retries.
-        this_thread::sleep_for(chrono::milliseconds(2000));
-        bool requeue = false;
-        if (requeue_or_fail(id, &requeue) && requeue)
-          booking_q.push(id);
-        break;
+  bool requeue_or_fail_booking_locked(Booking &b) {
+    b.retry_count++;
+    b.driver_id = -1;
+
+    if (b.retry_count >= MAX_BOOKING_RETRIES) {
+      b.state = BookingState::FAILED;
+      log_event("INFO", "BOOKING_FAILED", b.id, -1, "retry limit reached");
+      return false;
+    }
+
+    b.state = BookingState::QUEUED;
+    log_event("INFO", "BOOKING_REQUEUED", b.id, -1,
+              "retry=" + to_string(b.retry_count));
+    return true;
+  }
+
+  int find_nearest_driver(Position pickup) {
+    int best_id = -1;
+    int best_distance = INT_MAX;
+
+    for (int pass = 0; pass < 3; pass++) {
+      lock_guard<mutex> reg_lock(driver_reg_mtx);
+      for (auto &entry : drivers) {
+        Driver &d = *entry.second;
+        if (!d.mtx.try_lock())
+          continue;
+
+        if (d.state == DriverState::AVAILABLE) {
+          int dd = grid_distance(d.pos, pickup);
+          if (dd < best_distance) {
+            best_distance = dd;
+            best_id = d.id;
+          }
+        }
+
+        d.mtx.unlock();
       }
 
-      Driver *d = driver_reg.get(driver_id);
-      if (!d)
+      if (best_id != -1)
+        break;
+    }
+
+    return best_id;
+  }
+
+  void dispatcher_loop() {
+    while (true) {
+      int booking_id = booking_queue.wait_pop();
+      Booking *b = booking_ptr(booking_id);
+      if (!b)
         continue;
 
-      // Match found: reserve driver and update booking (inline transition)
+      Position pickup;
       {
-        lock_guard<mutex> dl(d->mtx);
+        lock_guard<mutex> booking_lock(b->mtx);
+        if (b->state != BookingState::QUEUED)
+          continue;
+        b->state = BookingState::MATCHING;
+        pickup = b->pickup;
+      }
+
+      log_event("INFO", "BOOKING_MATCHING", booking_id, -1,
+                "dispatcher started matching");
+
+      while (true) {
+        int driver_id = find_nearest_driver(pickup);
+
+        if (driver_id < 0) {
+          this_thread::sleep_for(chrono::milliseconds(2000));
+          requeue_or_fail(booking_id);
+          break;
+        }
+
+        Driver *d = driver_ptr(driver_id);
+        if (!d)
+          continue;
+
+        unique_lock<mutex> driver_lock(d->mtx);
         if (d->state != DriverState::AVAILABLE) {
-          // Driver was taken by another dispatcher between find_nearest
-          // and this lock — yield briefly then retry.
+          driver_lock.unlock();
           this_thread::sleep_for(chrono::milliseconds(100));
           continue;
         }
 
-        Booking *b2 = booking_reg.get(id);
+        Booking *b2 = booking_ptr(booking_id);
         if (!b2)
-          continue;
+          break;
 
-        lock_guard<mutex> bl2(b2->mtx);
+        unique_lock<mutex> booking_lock(b2->mtx);
         if (b2->state != BookingState::MATCHING)
-          continue;
+          break;
 
         b2->state = BookingState::WAITING;
-        b2->driver_id = d->driver_id;
+        b2->driver_id = d->id;
         d->state = DriverState::RESERVED;
-        d->booking_id = id;
+        d->booking_id = booking_id;
         d->offer_start_time = chrono::steady_clock::now();
+
+        log_event("INFO", "DRIVER_RESERVED", booking_id, driver_id,
+                  "dispatcher reserved driver");
+        break;
       }
-      log_event("INFO", "DRIVER_RESERVED", id, driver_id,
-                "dispatcher reserved driver");
-      break;
     }
   }
-}
 
-// ─── Monitor Actor
-// ──────────────────────────────────────────────────────────────────
+  void monitor_loop() {
+    while (true) {
+      vector<int> requeue_ids;
+      vector<pair<int, int>> expired_events;
 
-void expire_timed_out_reservations() {}
+      {
+        lock_guard<mutex> reg_lock(driver_reg_mtx);
+        for (auto &entry : drivers) {
+          Driver &d = *entry.second;
+          if (!d.mtx.try_lock())
+            continue;
 
-void monitor_actor() {
-  while (true) {
-    vector<int> expired;
+          if (d.state == DriverState::RESERVED) {
+            long long elapsed = chrono::duration_cast<chrono::milliseconds>(
+                                    chrono::steady_clock::now() -
+                                    d.offer_start_time)
+                                    .count();
 
-    {
-      lock_guard<mutex> rl(driver_reg.mtx);
-      for (auto &entry : driver_reg.drivers) {
-        Driver &d = *entry.second;
-        int bid = -1;
+            if (elapsed >= DRIVER_CONFIRM_TIMEOUT_MS) {
+              int booking_id = d.booking_id;
+              int driver_id = d.id;
+              Booking *b = booking_ptr(booking_id);
 
-        if (!d.mtx.try_lock())
-          continue;
-        if (d.state == DriverState::RESERVED) {
-          auto elapsed = chrono::duration_cast<chrono::milliseconds>(
-                             chrono::steady_clock::now() - d.offer_start_time)
-                             .count();
-          if (elapsed >= DRIVER_CONFIRM_TIMEOUT_MS) {
-            bid = d.booking_id;
-            d.state = DriverState::AVAILABLE;
-            d.booking_id = -1;
+              if (b) {
+                unique_lock<mutex> booking_lock(b->mtx);
+                if (b->state == BookingState::WAITING &&
+                    b->driver_id == driver_id) {
+                  d.state = DriverState::AVAILABLE;
+                  d.booking_id = -1;
+
+                  bool should_requeue = requeue_or_fail_booking_locked(*b);
+                  if (should_requeue)
+                    requeue_ids.push_back(booking_id);
+                  expired_events.push_back({booking_id, driver_id});
+                }
+              }
+            }
           }
+
+          d.mtx.unlock();
         }
-        d.mtx.unlock();
-        if (bid != -1)
-          expired.push_back(bid);
       }
-    }
 
-    for (int id : expired) {
-      bool requeue = false;
-      if (requeue_or_fail(id, &requeue) && requeue)
-        booking_q.push(id);
-      log_event("INFO", "DRIVER_TIMEOUT", id, -1, "reservation expired");
-    }
+      for (int booking_id : requeue_ids)
+        booking_queue.push(booking_id);
 
-    this_thread::sleep_for(chrono::milliseconds(50));
+      for (auto &event : expired_events) {
+        log_event("INFO", "DRIVER_TIMEOUT", event.first, event.second,
+                  "reservation expired");
+      }
+
+      this_thread::sleep_for(chrono::milliseconds(50));
+    }
+  }
+};
+
+// ─── Protocol Parsing ───────────────────────────────────────────────────────
+
+void uppercase(string &s) {
+  for (char &c : s) {
+    if (c >= 'a' && c <= 'z')
+      c = char(c - 'a' + 'A');
   }
 }
 
-// ─── Socket Protocol
-// ──────────────────────────────────────────────────────────────────
+bool has_extra(istringstream &iss) {
+  string extra;
+  return bool(iss >> extra);
+}
 
-string dispatch(const string &line) {
+string format_booking(const BookingView &b) {
+  return b.state + " " + to_string(b.driver_id) + " " +
+         to_string(b.retry_count);
+}
+
+string format_driver(const DriverView &d) {
+  return d.state + " " + to_string(d.booking_id) + " " + to_string(d.x) +
+         " " + to_string(d.y);
+}
+
+string handle_command(BookingSystem &system, const string &line) {
   istringstream iss(line);
   string cmd;
   iss >> cmd;
+
   if (cmd.empty())
     return "ERR EMPTY";
+  uppercase(cmd);
 
-  // BOOK px py dx dy
   if (cmd == "BOOK") {
     int px, py, dx, dy;
-    if (!(iss >> px >> py >> dx >> dy))
+    if (!(iss >> px >> py >> dx >> dy) || has_extra(iss))
       return "ERR ARGS";
-    return "OK " + to_string(create_booking({px, py}, {dx, dy}));
+
+    int id = system.create_booking({px, py}, {dx, dy});
+    return "OK " + to_string(id);
   }
 
-  // BOOKING id
   if (cmd == "BOOKING") {
     int id;
-    if (!(iss >> id))
+    if (!(iss >> id) || has_extra(iss))
       return "ERR ARGS";
-    Booking *b = booking_reg.get(id);
-    if (!b)
+
+    BookingView view;
+    if (!system.get_booking(id, view))
       return "ERR NOT_FOUND";
-    lock_guard<mutex> bl(b->mtx);
-    return booking_state_name(b->state) + " " + to_string(b->driver_id) + " " +
-           to_string(b->retry_count);
+    return format_booking(view);
   }
 
-  // BOOKINGS
   if (cmd == "BOOKINGS") {
-    vector<string> lines;
-    {
-      lock_guard<mutex> rl(booking_reg.mtx);
-      for (auto &entry : booking_reg.bookings) {
-        Booking &b = *entry.second;
-        lock_guard<mutex> bl(b.mtx);
-        lines.push_back(
-            to_string(b.booking_id) + " " + booking_state_name(b.state) + " " +
-            to_string(b.driver_id) + " " + to_string(b.retry_count));
-      }
+    if (has_extra(iss))
+      return "ERR ARGS";
+
+    vector<BookingView> views = system.list_bookings();
+    string resp = "OK " + to_string(views.size());
+    for (const BookingView &b : views) {
+      resp += " " + to_string(b.id) + " " + b.state + " " +
+              to_string(b.driver_id) + " " + to_string(b.retry_count);
     }
-    string resp = "OK " + to_string(lines.size());
-    for (auto &l : lines)
-      resp += " " + l;
     return resp;
   }
 
-  // ONLINE driver_id [x y]
   if (cmd == "ONLINE") {
     int id;
     if (!(iss >> id))
@@ -642,165 +727,169 @@ string dispatch(const string &line) {
     bool has_pos = false;
     Position pos = {0, 0};
     if (iss >> x) {
-      if (!(iss >> y))
+      if (!(iss >> y) || has_extra(iss))
         return "ERR ARGS";
       has_pos = true;
       pos = {x, y};
     }
 
-    return set_driver_online(id, has_pos, pos) ? "OK" : "ERR";
+    return system.set_driver_online(id, has_pos, pos) ? "OK" : "ERR";
   }
 
-  // OFFLINE driver_id
   if (cmd == "OFFLINE") {
     int id;
-    if (!(iss >> id))
+    if (!(iss >> id) || has_extra(iss))
       return "ERR ARGS";
-    return set_driver_offline(id) ? "OK" : "ERR";
+    return system.set_driver_offline(id) ? "OK" : "ERR";
   }
 
-  // DRIVER id
   if (cmd == "DRIVER") {
     int id;
-    if (!(iss >> id))
+    if (!(iss >> id) || has_extra(iss))
       return "ERR ARGS";
-    Driver *d = driver_reg.get(id);
-    if (!d)
+
+    DriverView view;
+    if (!system.get_driver(id, view))
       return "ERR NOT_FOUND";
-    lock_guard<mutex> dl(d->mtx);
-    return driver_state_name(d->state) + " " + to_string(d->booking_id) + " " +
-           to_string(d->pos.x) + " " + to_string(d->pos.y);
+    return format_driver(view);
   }
 
-  // DRIVERS
   if (cmd == "DRIVERS") {
-    vector<string> lines;
-    {
-      lock_guard<mutex> rl(driver_reg.mtx);
-      for (auto &entry : driver_reg.drivers) {
-        Driver &d = *entry.second;
-        lock_guard<mutex> dl(d.mtx);
-        lines.push_back(to_string(d.driver_id) + " " +
-                        driver_state_name(d.state) + " " +
-                        to_string(d.booking_id) + " " + to_string(d.pos.x) +
-                        " " + to_string(d.pos.y));
-      }
+    if (has_extra(iss))
+      return "ERR ARGS";
+
+    vector<DriverView> views = system.list_drivers();
+    string resp = "OK " + to_string(views.size());
+    for (const DriverView &d : views) {
+      resp += " " + to_string(d.id) + " " + d.state + " " +
+              to_string(d.booking_id) + " " + to_string(d.x) + " " +
+              to_string(d.y);
     }
-    string resp = "OK " + to_string(lines.size());
-    for (auto &l : lines)
-      resp += " " + l;
     return resp;
   }
 
-  // ACCEPT driver_id booking_id
-  // REJECT driver_id booking_id
-  // FINISH driver_id booking_id
   if (cmd == "ACCEPT" || cmd == "REJECT" || cmd == "FINISH") {
-    int did, bid;
-    if (!(iss >> did >> bid))
+    int driver_id, booking_id;
+    if (!(iss >> driver_id >> booking_id) || has_extra(iss))
       return "ERR ARGS";
 
+    bool ok = false;
     if (cmd == "ACCEPT")
-      return accept_booking(did, bid) ? "OK" : "ERR";
-    if (cmd == "REJECT")
-      return reject_booking(did, bid) ? "OK" : "ERR";
-    return finish_booking(did, bid) ? "OK" : "ERR";
+      ok = system.accept_booking(driver_id, booking_id);
+    else if (cmd == "REJECT")
+      ok = system.reject_booking(driver_id, booking_id);
+    else
+      ok = system.finish_booking(driver_id, booking_id);
+
+    return ok ? "OK" : "ERR";
   }
 
   return "ERR UNKNOWN";
 }
 
-// ─── Socket Server
-// ──────────────────────────────────────────────────────────────────
+// ─── TCP Server ──────────────────────────────────────────────────────────────
 
-void handler() {
-#ifndef _WIN32
-  signal(SIGPIPE, SIG_IGN);
-#endif
+class TcpServer {
+private:
+  Socket server_fd;
 
-  if (!socket_startup()) {
-    cerr << "socket startup failed" << endl;
-    exit(1);
+public:
+  TcpServer() : server_fd(INVALID_SOCKET_FD) {}
+
+  ~TcpServer() {
+    if (server_fd != INVALID_SOCKET_FD)
+      socket_close(server_fd);
   }
 
-  SocketHandle server_fd = socket(AF_INET, SOCK_STREAM, 0);
-  if (socket_is_invalid(server_fd)) {
-    cerr << "socket() failed" << endl;
-    socket_cleanup();
-    exit(1);
-  }
-
-  int yes = 1;
-  setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR,
-             reinterpret_cast<const char *>(&yes), sizeof(yes));
-
-  sockaddr_in addr = {};
-  addr.sin_family = AF_INET;
-  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-  addr.sin_port = htons(8000);
-
-  if (socket_call_failed(::bind(server_fd, (sockaddr *)&addr, sizeof(addr)))) {
-    cerr << "bind() failed" << endl;
-    close_socket(server_fd);
-    socket_cleanup();
-    exit(1);
-  }
-
-  if (socket_call_failed(listen(server_fd, 10))) {
-    cerr << "listen() failed" << endl;
-    close_socket(server_fd);
-    socket_cleanup();
-    exit(1);
-  }
-
-  while (true) {
-    sockaddr_in client_addr;
-    SocketLength client_len = sizeof(client_addr);
-    SocketHandle client_fd =
-        accept(server_fd, (sockaddr *)&client_addr, &client_len);
-    if (socket_is_invalid(client_fd))
-      continue;
-
-    char buf[4096];
-    int n = recv(client_fd, buf, static_cast<int>(sizeof(buf) - 1), 0);
-    string resp;
-
-    if (n > 0) {
-      buf[n] = '\0';
-      char *nl = strchr(buf, '\n');
-      if (nl)
-        *nl = '\0';
-      resp = dispatch(string(buf)) + "\n";
-      send(client_fd, resp.c_str(), static_cast<int>(resp.size()), 0);
+  bool start(int port) {
+    server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_fd == INVALID_SOCKET_FD) {
+      cerr << "socket() failed" << endl;
+      return false;
     }
 
-    close_socket(client_fd);
-  }
-}
+    int yes = 1;
+    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, (const char *)&yes,
+               sizeof(yes));
 
-// ─── Main
-// ─────────────────────────────────────────────────────────────────────
+    sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((unsigned short)port);
+
+#ifdef _WIN32
+    inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+#else
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+#endif
+
+    if (bind(server_fd, (sockaddr *)&addr, sizeof(addr)) < 0) {
+      cerr << "bind() failed" << endl;
+      return false;
+    }
+
+    if (listen(server_fd, 10) < 0) {
+      cerr << "listen() failed" << endl;
+      return false;
+    }
+
+    return true;
+  }
+
+  void run(BookingSystem &system) {
+    while (true) {
+      sockaddr_in client_addr;
+      memset(&client_addr, 0, sizeof(client_addr));
+#ifdef _WIN32
+      int client_len = sizeof(client_addr);
+#else
+      socklen_t client_len = sizeof(client_addr);
+#endif
+
+      Socket client_fd =
+          accept(server_fd, (sockaddr *)&client_addr, &client_len);
+      if (client_fd == INVALID_SOCKET_FD)
+        continue;
+
+      char buffer[4096];
+      int n = recv(client_fd, buffer, sizeof(buffer) - 1, 0);
+
+      if (n > 0) {
+        buffer[n] = '\0';
+        char *nl = strchr(buffer, '\n');
+        if (nl)
+          *nl = '\0';
+
+        string response = handle_command(system, string(buffer)) + "\n";
+        send(client_fd, response.c_str(), (int)response.size(), 0);
+      }
+
+      socket_close(client_fd);
+    }
+  }
+};
+
+// ─── Main ───────────────────────────────────────────────────────────────────
 
 int main() {
-  srand(time(nullptr));
-  int num_drivers = 50;
+  srand((unsigned)time(nullptr));
 
-  for (int i = 1; i <= num_drivers; i++) {
-    Position p = {rand() % MAP_W, rand() % MAP_H};
-    add_driver(i, p);
+  if (!socket_init()) {
+    cerr << "socket init failed" << endl;
+    return 1;
   }
-  log_event("INFO", "SERVER_STARTED", -1, -1,
-            "drivers=" + to_string(num_drivers));
 
-  vector<thread> dispatchers;
-  for (int i = 0; i < DISPATCHER_THREADS; i++)
-    dispatchers.emplace_back(dispatcher);
-  thread monitor_th(monitor_actor);
+  BookingSystem system;
 
-  for (auto &t : dispatchers)
-    t.detach();
-  monitor_th.detach();
+  TcpServer server;
+  if (!server.start(SERVER_PORT)) {
+    socket_cleanup();
+    return 1;
+  }
 
-  handler();
+  system.start_workers();
+  server.run(system);
+
+  socket_cleanup();
   return 0;
 }
