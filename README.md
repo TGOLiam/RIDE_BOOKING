@@ -11,80 +11,103 @@ The project demonstrates how mutex synchronization prevents race conditions when
 | `main.cpp` | C++17 backend with dispatcher threads, booking/driver registries, mutex-protected state, monitor actor, and TCP command handler. |
 | `driver_client.cpp` | C++17 terminal driver client that connects to the backend over TCP. |
 | `passenger_client.cpp` | C++17 terminal passenger client that creates and watches ride bookings over TCP. |
+| `Makefile` | Cross-platform GNU Make build file. Outputs binaries to `build/`. |
 | `SYSTEM_DESIGN.docx` | Server architecture and concurrency design document. |
 | `README.md` | Project overview and run instructions. |
 
 ## Build and run
 
-### macOS/Linux
+### Recommended: Makefile
+
+Build everything into `build/`:
 
 ```bash
-g++ -std=c++17 -Wall -Wextra -pthread main.cpp -o core2
-g++ -std=c++17 -Wall -Wextra -pthread driver_client.cpp -o driver_client
-g++ -std=c++17 -Wall -Wextra -pthread passenger_client.cpp -o passenger_client
-./core2
+make all
 ```
 
-In another terminal:
+Outputs:
+
+```text
+build/ride_server
+build/driver_client
+build/passenger_client
+```
+
+On Windows with MinGW/GNU Make, the outputs are:
+
+```text
+build/ride_server.exe
+build/driver_client.exe
+build/passenger_client.exe
+```
+
+Useful targets:
 
 ```bash
-./driver_client 1
+make server   # build only backend
+make clients  # build driver and passenger clients
+make run      # build and run backend
+make clean    # remove build/
 ```
 
-In another terminal:
+### Run locally
+
+Terminal 1 — backend:
 
 ```bash
-./passenger_client
+make run
 ```
 
-### Windows with MinGW g++
+Terminal 2 — driver client:
 
 ```bash
-g++ -std=c++17 -Wall -Wextra main.cpp -o core2.exe -lws2_32
-g++ -std=c++17 -Wall -Wextra driver_client.cpp -o driver_client.exe -lws2_32
-g++ -std=c++17 -Wall -Wextra passenger_client.cpp -o passenger_client.exe -lws2_32
-core2.exe
+./build/driver_client 1
 ```
 
-In another terminal:
+Inside the driver client, bring the driver online:
+
+```text
+online 4 7
+watch
+```
+
+Terminal 3 — passenger client:
 
 ```bash
-driver_client.exe 1
+./build/passenger_client
 ```
 
-In another terminal:
+Inside the passenger client, create a booking:
 
-```bash
-passenger_client.exe
-```
-
-### Windows with MSVC
-
-Run these commands from a Developer Command Prompt for Visual Studio:
-
-```bat
-cl /EHsc /std:c++17 main.cpp /Fe:core2.exe ws2_32.lib
-cl /EHsc /std:c++17 driver_client.cpp /Fe:driver_client.exe ws2_32.lib
-cl /EHsc /std:c++17 passenger_client.cpp /Fe:passenger_client.exe ws2_32.lib
-core2.exe
-```
-
-In another terminal:
-
-```bat
-driver_client.exe 1
-```
-
-In another terminal:
-
-```bat
-passenger_client.exe
+```text
+book 1 2 8 9
+watch
 ```
 
 The backend listens on:
 
 ```text
 127.0.0.1:8000
+```
+
+Drivers are not preloaded. A driver client creates/registers its driver ID by sending `ONLINE driver_id [x y]`, which the interactive driver client does through its `online` command.
+
+### Manual build fallback
+
+Linux/macOS:
+
+```bash
+g++ -std=c++17 -Wall -Wextra -pthread main.cpp -o build/ride_server
+g++ -std=c++17 -Wall -Wextra -pthread driver_client.cpp -o build/driver_client
+g++ -std=c++17 -Wall -Wextra -pthread passenger_client.cpp -o build/passenger_client
+```
+
+Windows with MinGW `g++`:
+
+```bash
+g++ -std=c++17 -Wall -Wextra main.cpp -o build/ride_server.exe -lws2_32
+g++ -std=c++17 -Wall -Wextra driver_client.cpp -o build/driver_client.exe -lws2_32
+g++ -std=c++17 -Wall -Wextra passenger_client.cpp -o build/passenger_client.exe -lws2_32
 ```
 
 ## TCP command protocol
