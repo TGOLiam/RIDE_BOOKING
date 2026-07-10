@@ -10,6 +10,7 @@ The project demonstrates how mutex synchronization prevents race conditions when
 |---|---|
 | `main.cpp` | C++17 backend with dispatcher threads, booking/driver registries, mutex-protected state, monitor actor, and TCP command handler. |
 | `driver_client.cpp` | C++17 terminal driver client that connects to the backend over TCP. |
+| `passenger_client.cpp` | C++17 terminal passenger client that creates and watches ride bookings over TCP. |
 | `SYSTEM_DESIGN.docx` | Server architecture and concurrency design document. |
 | `README.md` | Project overview and run instructions. |
 
@@ -20,6 +21,7 @@ The project demonstrates how mutex synchronization prevents race conditions when
 ```bash
 g++ -std=c++17 -Wall -Wextra -pthread main.cpp -o core2
 g++ -std=c++17 -Wall -Wextra -pthread driver_client.cpp -o driver_client
+g++ -std=c++17 -Wall -Wextra -pthread passenger_client.cpp -o passenger_client
 ./core2
 ```
 
@@ -29,11 +31,18 @@ In another terminal:
 ./driver_client 1
 ```
 
+In another terminal:
+
+```bash
+./passenger_client
+```
+
 ### Windows with MinGW g++
 
 ```bash
 g++ -std=c++17 -Wall -Wextra main.cpp -o core2.exe -lws2_32
 g++ -std=c++17 -Wall -Wextra driver_client.cpp -o driver_client.exe -lws2_32
+g++ -std=c++17 -Wall -Wextra passenger_client.cpp -o passenger_client.exe -lws2_32
 core2.exe
 ```
 
@@ -41,6 +50,12 @@ In another terminal:
 
 ```bash
 driver_client.exe 1
+```
+
+In another terminal:
+
+```bash
+passenger_client.exe
 ```
 
 ### Windows with MSVC
@@ -50,6 +65,7 @@ Run these commands from a Developer Command Prompt for Visual Studio:
 ```bat
 cl /EHsc /std:c++17 main.cpp /Fe:core2.exe ws2_32.lib
 cl /EHsc /std:c++17 driver_client.cpp /Fe:driver_client.exe ws2_32.lib
+cl /EHsc /std:c++17 passenger_client.cpp /Fe:passenger_client.exe ws2_32.lib
 core2.exe
 ```
 
@@ -57,6 +73,12 @@ In another terminal:
 
 ```bat
 driver_client.exe 1
+```
+
+In another terminal:
+
+```bat
+passenger_client.exe
 ```
 
 The backend listens on:
@@ -88,6 +110,29 @@ The command protocol is easiest to understand as client-to-server messages.
 
 #### Passenger client flow
 
+Start a passenger client:
+
+```bash
+./passenger_client
+```
+
+The passenger client defaults to `127.0.0.1:8000`. To connect to a different server:
+
+```bash
+./passenger_client 127.0.0.1 8000
+```
+
+Passenger client commands:
+
+```text
+book [px py dx dy]  request a ride (prompts if no args)
+status <booking>    show current state of a booking
+watch [booking]     poll a booking until it settles
+list                show all bookings (testing only)
+help                show the command menu
+quit                exit
+```
+
 ```text
 Passenger client books a ride
   -> BOOK pickup_x pickup_y destination_x destination_y
@@ -112,6 +157,14 @@ Server -> WAITING 3 0
 Server -> BOOKED 3 0
 Server -> COMPLETED 3 0
 Server -> FAILED -1 5
+```
+
+Example passenger terminal flow:
+
+```text
+passenger> book 1 1 8 8
+Booking created: #42
+passenger> watch
 ```
 
 #### Driver client flow
