@@ -1,22 +1,69 @@
 #include <chrono>
 #include <climits>
-#include <csignal>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <iostream>
 #include <map>
 #include <memory>
 #include <mutex>
-#include <netinet/in.h>
 #include <queue>
 #include <sstream>
 #include <string>
-#include <sys/socket.h>
 #include <thread>
-#include <unistd.h>
+#include <utility>
 #include <vector>
 
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#ifdef _MSC_VER
+#pragma comment(lib, "Ws2_32.lib")
+#endif
+#else
+#include <csignal>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#endif
+
 using namespace std;
+
+#ifdef _WIN32
+using SocketHandle = SOCKET;
+using SocketLength = int;
+const SocketHandle INVALID_SOCKET_HANDLE = INVALID_SOCKET;
+
+bool socket_startup() {
+  WSADATA data;
+  return WSAStartup(MAKEWORD(2, 2), &data) == 0;
+}
+
+void socket_cleanup() { WSACleanup(); }
+
+void close_socket(SocketHandle fd) { closesocket(fd); }
+
+bool socket_call_failed(int result) { return result == SOCKET_ERROR; }
+#else
+using SocketHandle = int;
+using SocketLength = socklen_t;
+const SocketHandle INVALID_SOCKET_HANDLE = -1;
+
+bool socket_startup() { return true; }
+
+void socket_cleanup() {}
+
+void close_socket(SocketHandle fd) { close(fd); }
+
+bool socket_call_failed(int result) { return result < 0; }
+#endif
+
+bool socket_is_invalid(SocketHandle fd) {
+  return fd == INVALID_SOCKET_HANDLE;
+}
 
 // ─── Config
 // ────────────────────────────────────────────────────────────────
@@ -132,7 +179,7 @@ struct BookingRegistry {
 
   bool add(unique_ptr<Booking> b) {
     lock_guard<mutex> lock(mtx);
-    bookings[b->booking_id] = move(b);
+    bookings[b->booking_id] = std::move(b);
     return true;
   }
 
@@ -153,7 +200,7 @@ struct DriverRegistry {
 
   bool add(unique_ptr<Driver> d) {
     lock_guard<mutex> lock(mtx);
-    drivers[d->driver_id] = move(d);
+    drivers[d->driver_id] = std::move(d);
     return true;
   }
 
@@ -214,10 +261,10 @@ void log_event(const string &level, const string &event, int booking_id,
 void add_driver(int id, Position pos) {
   auto d = make_unique<Driver>();
   d->driver_id = id;
-  d->state = DriverState::AVAILABLE;
+  d->state = DriverState::OFFLINE;
   d->booking_id = -1;
   d->pos = pos;
-  driver_reg.add(move(d));
+  driver_reg.add(std::move(d));
 }
 
 // ─── Passenger Booking Flow
@@ -238,7 +285,7 @@ int create_booking(Position pickup, Position destination) {
   b->pickup = pickup;
   b->destination = destination;
 
-  booking_reg.add(move(b));
+  booking_reg.add(std::move(b));
   booking_q.push(id);
   log_event("INFO", "BOOKING_CREATED", id, -1, "queued");
   return id;
@@ -274,6 +321,53 @@ bool requeue_or_fail(int booking_id, bool *requeue) {
 
 // ─── Driver Action Flow
 // ─────────────────────────────────────────────────────────────
+
+bool set_driver_online(int driver_id, bool has_pos, Position pos) {
+  Driver *d = driver_reg.get(driver_id);
+  if (!d)
+    return false;
+
+  lock_guard<mutex> dl(d->mtx);
+  if (d->state == DriverState::RESERVED || d->state == DriverState::BOOKED)
+    return false;
+
+  if (has_pos)
+    d->pos = pos;
+  d->state = DriverState::AVAILABLE;
+  d->booking_id = -1;
+
+  log_event("INFO", "DRIVER_ONLINE", -1, driver_id, "driver available");
+  return true;
+}
+
+bool set_driver_offline(int driver_id) {
+  Driver *d = driver_reg.get(driver_id);
+  if (!d)
+    return false;
+
+  int booking_id = -1;
+
+  {
+    lock_guard<mutex> dl(d->mtx);
+    if (d->state == DriverState::BOOKED)
+      return false;
+
+    if (d->state == DriverState::RESERVED)
+      booking_id = d->booking_id;
+
+    d->state = DriverState::OFFLINE;
+    d->booking_id = -1;
+  }
+
+  if (booking_id != -1) {
+    bool requeue = false;
+    if (requeue_or_fail(booking_id, &requeue) && requeue)
+      booking_q.push(booking_id);
+  }
+
+  log_event("INFO", "DRIVER_OFFLINE", booking_id, driver_id, "driver offline");
+  return true;
+}
 
 bool accept_booking(int driver_id, int booking_id) {
   Driver *d = driver_reg.get(driver_id);
@@ -538,6 +632,33 @@ string dispatch(const string &line) {
     return resp;
   }
 
+  // ONLINE driver_id [x y]
+  if (cmd == "ONLINE") {
+    int id;
+    if (!(iss >> id))
+      return "ERR ARGS";
+
+    int x, y;
+    bool has_pos = false;
+    Position pos = {0, 0};
+    if (iss >> x) {
+      if (!(iss >> y))
+        return "ERR ARGS";
+      has_pos = true;
+      pos = {x, y};
+    }
+
+    return set_driver_online(id, has_pos, pos) ? "OK" : "ERR";
+  }
+
+  // OFFLINE driver_id
+  if (cmd == "OFFLINE") {
+    int id;
+    if (!(iss >> id))
+      return "ERR ARGS";
+    return set_driver_offline(id) ? "OK" : "ERR";
+  }
+
   // DRIVER id
   if (cmd == "DRIVER") {
     int id;
@@ -593,41 +714,55 @@ string dispatch(const string &line) {
 // ──────────────────────────────────────────────────────────────────
 
 void handler() {
+#ifndef _WIN32
   signal(SIGPIPE, SIG_IGN);
+#endif
 
-  int server_fd = socket(AF_INET, SOCK_STREAM, 0);
-  if (server_fd < 0) {
+  if (!socket_startup()) {
+    cerr << "socket startup failed" << endl;
+    exit(1);
+  }
+
+  SocketHandle server_fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (socket_is_invalid(server_fd)) {
     cerr << "socket() failed" << endl;
+    socket_cleanup();
     exit(1);
   }
 
   int yes = 1;
-  setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+  setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR,
+             reinterpret_cast<const char *>(&yes), sizeof(yes));
 
   sockaddr_in addr = {};
   addr.sin_family = AF_INET;
   addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
   addr.sin_port = htons(8000);
 
-  if (bind(server_fd, (sockaddr *)&addr, sizeof(addr)) < 0) {
+  if (socket_call_failed(::bind(server_fd, (sockaddr *)&addr, sizeof(addr)))) {
     cerr << "bind() failed" << endl;
+    close_socket(server_fd);
+    socket_cleanup();
     exit(1);
   }
 
-  if (listen(server_fd, 10) < 0) {
+  if (socket_call_failed(listen(server_fd, 10))) {
     cerr << "listen() failed" << endl;
+    close_socket(server_fd);
+    socket_cleanup();
     exit(1);
   }
 
   while (true) {
     sockaddr_in client_addr;
-    socklen_t client_len = sizeof(client_addr);
-    int client_fd = accept(server_fd, (sockaddr *)&client_addr, &client_len);
-    if (client_fd < 0)
+    SocketLength client_len = sizeof(client_addr);
+    SocketHandle client_fd =
+        accept(server_fd, (sockaddr *)&client_addr, &client_len);
+    if (socket_is_invalid(client_fd))
       continue;
 
     char buf[4096];
-    int n = recv(client_fd, buf, sizeof(buf) - 1, 0);
+    int n = recv(client_fd, buf, static_cast<int>(sizeof(buf) - 1), 0);
     string resp;
 
     if (n > 0) {
@@ -636,10 +771,10 @@ void handler() {
       if (nl)
         *nl = '\0';
       resp = dispatch(string(buf)) + "\n";
-      send(client_fd, resp.c_str(), resp.size(), 0);
+      send(client_fd, resp.c_str(), static_cast<int>(resp.size()), 0);
     }
 
-    close(client_fd);
+    close_socket(client_fd);
   }
 }
 
