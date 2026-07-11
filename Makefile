@@ -24,22 +24,18 @@ endif
 SERVER_SRC := src/server/main.cpp
 DRIVER_CLIENT_SRC := src/clients/driver_client.cpp
 PASSENGER_CLIENT_SRC := src/clients/passenger_client.cpp
-RACE_DEMO_SRC := src/demos/race_demo.cpp
 
 SERVER := $(BUILD_DIR)/ride_server$(EXE)
 DRIVER_CLIENT := $(BUILD_DIR)/driver_client$(EXE)
 PASSENGER_CLIENT := $(BUILD_DIR)/passenger_client$(EXE)
-RACE_DEMO := $(BUILD_DIR)/race_demo$(EXE)
 
-.PHONY: all server clients demos race-demo run clean help
+.PHONY: all server clients run clean help
 
-all: $(SERVER) $(DRIVER_CLIENT) $(PASSENGER_CLIENT) $(RACE_DEMO)
+all: $(SERVER) $(DRIVER_CLIENT) $(PASSENGER_CLIENT)
 
 server: $(SERVER)
 
 clients: $(DRIVER_CLIENT) $(PASSENGER_CLIENT)
-
-demos: $(RACE_DEMO)
 
 $(BUILD_DIR):
 	$(MKDIR_BUILD)
@@ -53,31 +49,21 @@ $(DRIVER_CLIENT): $(DRIVER_CLIENT_SRC) | $(BUILD_DIR)
 $(PASSENGER_CLIENT): $(PASSENGER_CLIENT_SRC) | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) $< -o $@ $(LDFLAGS) $(LDLIBS)
 
-$(RACE_DEMO): $(RACE_DEMO_SRC) | $(BUILD_DIR)
-	$(CXX) $(CXXFLAGS) $< -o $@ $(LDFLAGS) $(LDLIBS)
-
 run: $(SERVER)
 	$(SERVER)
-
-race-demo: $(RACE_DEMO)
-	$(RACE_DEMO) unsafe || true
-	$(RACE_DEMO) safe
 
 clean:
 	$(RM_BUILD)
 
 help:
 	@echo "Targets:"
-	@echo "  make all       Build server, clients, and demos into build/"
-	@echo "  make server    Build only the backend server"
-	@echo "  make clients   Build driver and passenger clients"
-	@echo "  make demos     Build demo programs"
-	@echo "  make race-demo Build and run unsafe/safe race demo"
-	@echo "  make run       Build and run the backend server"
-	@echo "  make clean     Remove build/"
+	@echo "  make all      Build server and clients into build/"
+	@echo "  make server   Build only the backend server"
+	@echo "  make clients  Build driver and passenger clients"
+	@echo "  make run      Build and run the backend server"
+	@echo "  make clean    Remove build/"
 	@echo ""
 	@echo "Outputs:"
 	@echo "  $(SERVER)"
 	@echo "  $(DRIVER_CLIENT)"
 	@echo "  $(PASSENGER_CLIENT)"
-	@echo "  $(RACE_DEMO)"
