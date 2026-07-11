@@ -1,200 +1,23 @@
+#pragma once
+
+#include "../common/types.hpp"
+#include "booking.hpp"
+#include "booking_queue.hpp"
+#include "driver.hpp"
+#include "logger.hpp"
+
 #include <chrono>
 #include <climits>
-#include <condition_variable>
 #include <cstdlib>
-#include <cstring>
-#include <ctime>
-#include <iostream>
 #include <map>
 #include <memory>
 #include <mutex>
-#include <queue>
-#include <sstream>
 #include <string>
 #include <thread>
 #include <utility>
 #include <vector>
 
-#ifdef _WIN32
-#define NOMINMAX
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#pragma comment(lib, "Ws2_32.lib")
-using Socket = SOCKET;
-const Socket INVALID_SOCKET_FD = INVALID_SOCKET;
-#else
-#include <arpa/inet.h>
-#include <csignal>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <unistd.h>
-using Socket = int;
-const Socket INVALID_SOCKET_FD = -1;
-#endif
-
 using namespace std;
-
-// ─── Constants ──────────────────────────────────────────────────────────────
-
-const int MAP_W = 100;
-const int MAP_H = 100;
-const int DISPATCHER_THREADS = 4;
-const int DRIVER_CONFIRM_TIMEOUT_MS = 5000;
-const int MAX_BOOKING_RETRIES = 5;
-const int SERVER_PORT = 8000;
-
-// ─── Platform Socket Helpers ────────────────────────────────────────────────
-
-bool socket_init() {
-#ifdef _WIN32
-  WSADATA data;
-  return WSAStartup(MAKEWORD(2, 2), &data) == 0;
-#else
-  signal(SIGPIPE, SIG_IGN);
-  return true;
-#endif
-}
-
-void socket_cleanup() {
-#ifdef _WIN32
-  WSACleanup();
-#endif
-}
-
-void socket_close(Socket s) {
-#ifdef _WIN32
-  closesocket(s);
-#else
-  close(s);
-#endif
-}
-
-// ─── Domain Types ───────────────────────────────────────────────────────────
-
-struct Position {
-  int x;
-  int y;
-};
-
-int grid_distance(Position a, Position b) {
-  return abs(a.x - b.x) + abs(a.y - b.y);
-}
-
-enum class DriverState { AVAILABLE, RESERVED, BOOKED, OFFLINE };
-
-enum class BookingState {
-  QUEUED,
-  MATCHING,
-  WAITING,
-  BOOKED,
-  COMPLETED,
-  FAILED
-};
-
-string driver_state_name(DriverState s) {
-  switch (s) {
-  case DriverState::AVAILABLE:
-    return "AVAILABLE";
-  case DriverState::RESERVED:
-    return "RESERVED";
-  case DriverState::BOOKED:
-    return "BOOKED";
-  case DriverState::OFFLINE:
-    return "OFFLINE";
-  }
-  return "UNKNOWN";
-}
-
-string booking_state_name(BookingState s) {
-  switch (s) {
-  case BookingState::QUEUED:
-    return "QUEUED";
-  case BookingState::MATCHING:
-    return "MATCHING";
-  case BookingState::WAITING:
-    return "WAITING";
-  case BookingState::BOOKED:
-    return "BOOKED";
-  case BookingState::COMPLETED:
-    return "COMPLETED";
-  case BookingState::FAILED:
-    return "FAILED";
-  }
-  return "UNKNOWN";
-}
-
-struct Driver {
-  int id;
-  DriverState state;
-  int booking_id;
-  Position pos;
-  chrono::steady_clock::time_point offer_start_time;
-  mutex mtx;
-};
-
-struct Booking {
-  int id;
-  BookingState state;
-  int driver_id;
-  int retry_count;
-  Position pickup;
-  Position destination;
-  mutex mtx;
-};
-
-struct BookingView {
-  int id;
-  string state;
-  int driver_id;
-  int retry_count;
-};
-
-struct DriverView {
-  int id;
-  string state;
-  int booking_id;
-  int x;
-  int y;
-};
-
-// ─── Logger ─────────────────────────────────────────────────────────────────
-
-mutex log_mtx;
-
-void log_event(const string &level, const string &event, int booking_id,
-               int driver_id, const string &message) {
-  lock_guard<mutex> lock(log_mtx);
-  cerr << "[" << level << "] " << event << " booking=" << booking_id
-       << " driver=" << driver_id << " " << message << endl;
-}
-
-// ─── BookingQueue ───────────────────────────────────────────────────────────
-
-class BookingQueue {
-private:
-  queue<int> q;
-  mutex mtx;
-  condition_variable cv;
-
-public:
-  void push(int id) {
-    {
-      lock_guard<mutex> lock(mtx);
-      q.push(id);
-    }
-    cv.notify_one();
-  }
-
-  int wait_pop() {
-    unique_lock<mutex> lock(mtx);
-    cv.wait(lock, [&] { return !q.empty(); });
-    int id = q.front();
-    q.pop();
-    return id;
-  }
-};
-
-// ─── BookingSystem ──────────────────────────────────────────────────────────
 
 class BookingSystem {
 private:
@@ -265,6 +88,36 @@ public:
     }
 
     return result;
+  }
+
+  bool check_double_booking(string &detail) {
+    map<int, int> driver_to_booking;
+    vector<unique_lock<mutex>> booking_locks;
+
+    lock_guard<mutex> reg_lock(booking_reg_mtx);
+    booking_locks.reserve(bookings.size());
+    for (auto &entry : bookings)
+      booking_locks.emplace_back(entry.second->mtx);
+
+    for (auto &entry : bookings) {
+      Booking &b = *entry.second;
+      bool active_assignment =
+          (b.state == BookingState::WAITING || b.state == BookingState::BOOKED) &&
+          b.driver_id != -1;
+      if (!active_assignment)
+        continue;
+
+      auto seen = driver_to_booking.find(b.driver_id);
+      if (seen != driver_to_booking.end() && seen->second != b.id) {
+        detail = "driver=" + to_string(b.driver_id) + " bookings=" +
+                 to_string(seen->second) + "," + to_string(b.id);
+        return false;
+      }
+      driver_to_booking[b.driver_id] = b.id;
+    }
+
+    detail = "none";
+    return true;
   }
 
   bool get_driver(int id, DriverView &out) {
@@ -659,245 +512,3 @@ private:
     }
   }
 };
-
-// ─── Protocol Parsing ───────────────────────────────────────────────────────
-
-void uppercase(string &s) {
-  for (char &c : s) {
-    if (c >= 'a' && c <= 'z')
-      c = char(c - 'a' + 'A');
-  }
-}
-
-bool has_extra(istringstream &iss) {
-  string extra;
-  return bool(iss >> extra);
-}
-
-string format_booking(const BookingView &b) {
-  return b.state + " " + to_string(b.driver_id) + " " +
-         to_string(b.retry_count);
-}
-
-string format_driver(const DriverView &d) {
-  return d.state + " " + to_string(d.booking_id) + " " + to_string(d.x) + " " +
-         to_string(d.y);
-}
-
-string handle_command(BookingSystem &system, const string &line) {
-  istringstream iss(line);
-  string cmd;
-  iss >> cmd;
-
-  if (cmd.empty())
-    return "ERR EMPTY";
-  uppercase(cmd);
-
-  if (cmd == "BOOK") {
-    int px, py, dx, dy;
-    if (!(iss >> px >> py >> dx >> dy) || has_extra(iss))
-      return "ERR ARGS";
-
-    int id = system.create_booking({px, py}, {dx, dy});
-    return "OK " + to_string(id);
-  }
-
-  if (cmd == "BOOKING") {
-    int id;
-    if (!(iss >> id) || has_extra(iss))
-      return "ERR ARGS";
-
-    BookingView view;
-    if (!system.get_booking(id, view))
-      return "ERR NOT_FOUND";
-    return format_booking(view);
-  }
-
-  if (cmd == "BOOKINGS") {
-    if (has_extra(iss))
-      return "ERR ARGS";
-
-    vector<BookingView> views = system.list_bookings();
-    string resp = "OK " + to_string(views.size());
-    for (const BookingView &b : views) {
-      resp += " " + to_string(b.id) + " " + b.state + " " +
-              to_string(b.driver_id) + " " + to_string(b.retry_count);
-    }
-    return resp;
-  }
-
-  if (cmd == "ONLINE") {
-    int id;
-    if (!(iss >> id))
-      return "ERR ARGS";
-
-    int x, y;
-    bool has_pos = false;
-    Position pos = {0, 0};
-    if (iss >> x) {
-      if (!(iss >> y) || has_extra(iss))
-        return "ERR ARGS";
-      has_pos = true;
-      pos = {x, y};
-    }
-
-    return system.set_driver_online(id, has_pos, pos) ? "OK" : "ERR";
-  }
-
-  if (cmd == "OFFLINE") {
-    int id;
-    if (!(iss >> id) || has_extra(iss))
-      return "ERR ARGS";
-    return system.set_driver_offline(id) ? "OK" : "ERR";
-  }
-
-  if (cmd == "DRIVER") {
-    int id;
-    if (!(iss >> id) || has_extra(iss))
-      return "ERR ARGS";
-
-    DriverView view;
-    if (!system.get_driver(id, view))
-      return "ERR NOT_FOUND";
-    return format_driver(view);
-  }
-
-  if (cmd == "DRIVERS") {
-    if (has_extra(iss))
-      return "ERR ARGS";
-
-    vector<DriverView> views = system.list_drivers();
-    string resp = "OK " + to_string(views.size());
-    for (const DriverView &d : views) {
-      resp += " " + to_string(d.id) + " " + d.state + " " +
-              to_string(d.booking_id) + " " + to_string(d.x) + " " +
-              to_string(d.y);
-    }
-    return resp;
-  }
-
-  if (cmd == "ACCEPT" || cmd == "REJECT" || cmd == "FINISH") {
-    int driver_id, booking_id;
-    if (!(iss >> driver_id >> booking_id) || has_extra(iss))
-      return "ERR ARGS";
-
-    bool ok = false;
-    if (cmd == "ACCEPT")
-      ok = system.accept_booking(driver_id, booking_id);
-    else if (cmd == "REJECT")
-      ok = system.reject_booking(driver_id, booking_id);
-    else
-      ok = system.finish_booking(driver_id, booking_id);
-
-    return ok ? "OK" : "ERR";
-  }
-
-  return "ERR UNKNOWN";
-}
-
-// ─── TCP Server ──────────────────────────────────────────────────────────────
-
-class TcpServer {
-private:
-  Socket server_fd;
-
-public:
-  TcpServer() : server_fd(INVALID_SOCKET_FD) {}
-
-  ~TcpServer() {
-    if (server_fd != INVALID_SOCKET_FD)
-      socket_close(server_fd);
-  }
-
-  bool start(int port) {
-    server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_fd == INVALID_SOCKET_FD) {
-      cerr << "socket() failed" << endl;
-      return false;
-    }
-
-    int yes = 1;
-    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, (const char *)&yes,
-               sizeof(yes));
-
-    sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons((unsigned short)port);
-
-#ifdef _WIN32
-    inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
-#else
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-#endif
-
-    if (bind(server_fd, (sockaddr *)&addr, sizeof(addr)) < 0) {
-      cerr << "bind() failed" << endl;
-      return false;
-    }
-
-    if (listen(server_fd, 10) < 0) {
-      cerr << "listen() failed" << endl;
-      return false;
-    }
-
-    return true;
-  }
-
-  void run(BookingSystem &system) {
-    while (true) {
-      sockaddr_in client_addr;
-      memset(&client_addr, 0, sizeof(client_addr));
-#ifdef _WIN32
-      int client_len = sizeof(client_addr);
-#else
-      socklen_t client_len = sizeof(client_addr);
-#endif
-
-      Socket client_fd =
-          accept(server_fd, (sockaddr *)&client_addr, &client_len);
-      if (client_fd == INVALID_SOCKET_FD)
-        continue;
-
-      char buffer[4096];
-      int n = recv(client_fd, buffer, sizeof(buffer) - 1, 0);
-
-      if (n > 0) {
-        buffer[n] = '\0';
-        char *nl = strchr(buffer, '\n');
-        if (nl)
-          *nl = '\0';
-
-        string response = handle_command(system, string(buffer)) + "\n";
-        send(client_fd, response.c_str(), (int)response.size(), 0);
-      }
-
-      socket_close(client_fd);
-    }
-  }
-};
-
-// ─── Main ───────────────────────────────────────────────────────────────────
-
-int main() {
-  srand((unsigned)time(nullptr));
-
-  if (!socket_init()) {
-    cerr << "socket init failed" << endl;
-    return 1;
-  }
-
-  BookingSystem system;
-
-  TcpServer server;
-  if (!server.start(SERVER_PORT)) {
-    socket_cleanup();
-    return 1;
-  }
-
-  system.start_workers();
-  server.run(system);
-
-  socket_cleanup();
-  return 0;
-}
