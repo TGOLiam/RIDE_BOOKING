@@ -24,18 +24,22 @@ endif
 SERVER_SRC := src/server/main.cpp
 DRIVER_CLIENT_SRC := src/clients/driver_client.cpp
 PASSENGER_CLIENT_SRC := src/clients/passenger_client.cpp
+PROBLEM_ONLY_SRC := src/demos/problem_only.cpp
 
 SERVER := $(BUILD_DIR)/ride_server$(EXE)
 DRIVER_CLIENT := $(BUILD_DIR)/driver_client$(EXE)
 PASSENGER_CLIENT := $(BUILD_DIR)/passenger_client$(EXE)
+PROBLEM_ONLY := $(BUILD_DIR)/problem_only$(EXE)
 
-.PHONY: all server clients run clean help
+.PHONY: all server clients demos problem-only run clean help
 
-all: $(SERVER) $(DRIVER_CLIENT) $(PASSENGER_CLIENT)
+all: $(SERVER) $(DRIVER_CLIENT) $(PASSENGER_CLIENT) $(PROBLEM_ONLY)
 
 server: $(SERVER)
 
 clients: $(DRIVER_CLIENT) $(PASSENGER_CLIENT)
+
+demos: $(PROBLEM_ONLY)
 
 $(BUILD_DIR):
 	$(MKDIR_BUILD)
@@ -49,6 +53,12 @@ $(DRIVER_CLIENT): $(DRIVER_CLIENT_SRC) | $(BUILD_DIR)
 $(PASSENGER_CLIENT): $(PASSENGER_CLIENT_SRC) | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) $< -o $@ $(LDFLAGS) $(LDLIBS)
 
+$(PROBLEM_ONLY): $(PROBLEM_ONLY_SRC) | $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) $< -o $@ $(LDFLAGS) $(LDLIBS)
+
+problem-only: $(PROBLEM_ONLY)
+	$(PROBLEM_ONLY)
+
 run: $(SERVER)
 	$(SERVER)
 
@@ -57,13 +67,16 @@ clean:
 
 help:
 	@echo "Targets:"
-	@echo "  make all      Build server and clients into build/"
-	@echo "  make server   Build only the backend server"
-	@echo "  make clients  Build driver and passenger clients"
-	@echo "  make run      Build and run the backend server"
-	@echo "  make clean    Remove build/"
+	@echo "  make all          Build server, clients, and demo into build/"
+	@echo "  make server       Build only the backend server"
+	@echo "  make clients      Build driver and passenger clients"
+	@echo "  make demos        Build demo programs"
+	@echo "  make problem-only Build and run race-condition problem demo"
+	@echo "  make run          Build and run the backend server"
+	@echo "  make clean        Remove build/"
 	@echo ""
 	@echo "Outputs:"
 	@echo "  $(SERVER)"
 	@echo "  $(DRIVER_CLIENT)"
 	@echo "  $(PASSENGER_CLIENT)"
+	@echo "  $(PROBLEM_ONLY)"
